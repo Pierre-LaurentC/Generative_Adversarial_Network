@@ -1,22 +1,25 @@
 from __future__ import print_function, division
-
+import tensorflow as tf 
 from keras.layers import Input, Dense, Reshape, Flatten, Dropout, multiply, GaussianNoise
 from keras.layers import BatchNormalization, Activation, Embedding, ZeroPadding2D
 from keras.layers import MaxPooling2D
 from keras.layers.advanced_activations import LeakyReLU
 from keras.layers.convolutional import UpSampling2D, Conv2D
 from keras.models import Sequential, Model
-from keras.optimizers import Adam
+from keras.optimizers import Adam, RMSprop
 from keras import losses
 from keras.utils import to_categorical
 import keras.backend as K
 import os
-import sys
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import MinMaxScaler
-
-import numpy as np
 import math
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from keras.utils.vis_utils import plot_model
+import keras.backend as K
+from keras.optimizers import RMSprop
+from IPython.display import clear_output
+
 
 numberOfFiles=0
 try: 
@@ -37,7 +40,7 @@ nans = np.empty([])
 for i in range(y2_train.shape[0]):
     if math.isnan(np.sum(y2_train[i])):
         nans = np.append(nans, i)
-y2_train = np.delete(y2_train, nans, axis=0)    
+y2_train = np.delete(y2_train, nans.astype(int), axis=0)    
 
 scaler = MinMaxScaler(feature_range=(-1,1), copy=True)
 for i in range(y2_train.shape[0]):
@@ -65,7 +68,7 @@ def build_generator():
     model.add(Dropout(0.5))
 
     # Decoder
-    model.add(UpSampling2D())
+    model.add(UpSampling2D((2,4)))
     model.add(Conv2D(128, kernel_size=3, padding="same"))
     model.add(Activation('relu'))
     model.add(BatchNormalization(momentum=0.8))
@@ -75,37 +78,45 @@ def build_generator():
     model.add(BatchNormalization(momentum=0.8))
     model.add(Conv2D(channels, kernel_size=3, padding="same"))
     model.add(Activation('tanh'))
-
     masked_img = Input(shape=img_shape)
     gen_missing = model(masked_img)
+
     return Model(masked_img, gen_missing)
+
 
 
 def build_discriminator():
 
-	model = Sequential()
+    model = Sequential()
 
-	model.add(Conv2D(64, kernel_size=3, strides=2, input_shape=missing_shape, padding="same"))
-	model.add(LeakyReLU(alpha=0.2))
-	model.add(BatchNormalization(momentum=0.8))
-	model.add(Conv2D(128, kernel_size=3, strides=2, padding="same"))
-	model.add(LeakyReLU(alpha=0.2))
-	model.add(BatchNormalization(momentum=0.8))
-	model.add(Conv2D(256, kernel_size=3, padding="same"))
-	model.add(LeakyReLU(alpha=0.2))
-	model.add(BatchNormalization(momentum=0.8))
-	model.add(Flatten())
-	model.add(Dense(1, activation='sigmoid'))
+    model.add(Conv2D(32, kernel_size=3, strides=2, input_shape=missing_shape, padding="same"))
+    model.add(LeakyReLU(alpha=0.2))
+    model.add(BatchNormalization(momentum=0.8))
+    model.add(Conv2D(64, kernel_size=3, strides=2, padding="same"))
+    model.add(LeakyReLU(alpha=0.2))
+    model.add(BatchNormalization(momentum=0.8))
+    model.add(Conv2D(128, kernel_size=3, padding="same"))
+    model.add(LeakyReLU(alpha=0.2))
+    model.add(BatchNormalization(momentum=0.8))
+    model.add(Conv2D(256, kernel_size=3, padding="same"))
+    model.add(LeakyReLU(alpha=0.2))
+    model.add(BatchNormalization(momentum=0.8))
+    model.add(Flatten())
+    model.add(Dense(1, activation='sigmoid'))
 
-	img = Input(shape=missing_shape)
-	validity = model(img)
+    img = Input(shape=missing_shape)
+    validity = model(img)
 
-	return Model(img, validity)
+    return Model(img, validity)
+
+def binary_crossentropy_label_smoothing(y_true, y_pred):
+    return tf.losses.binary_crossentropy(y_true, y_pred, label_smoothing=0.3)
+
 
 img_rows = 24
 img_cols = 144
 mask_height = 12
-mask_width = 72
+mask_width = 144
 channels = 1
 num_classes = 2
 img_shape = (img_rows, img_cols, channels)
@@ -118,8 +129,8 @@ discriminator = build_discriminator()
 
 # # For the combined model we will only train the generator
 discriminator.trainable = False
-
-discriminator.compile(loss='binary_crossentropy',
+# 'binary_crossentropy'
+discriminator.compile(loss=binary_crossentropy_label_smoothing,
     optimizer=optimizer,
     metrics=['accuracy'])
 
@@ -138,14 +149,14 @@ valid = discriminator(gen_missing)
 # # # The combined model  (stacked generator and discriminator)
 # # # Trains generator to fool discriminator
 combined = Model(masked_img , [gen_missing, valid])
-combined.compile(loss=['mse', 'binary_crossentropy'],
+combined.compile(loss=['mse', binary_crossentropy_label_smoothing],
     loss_weights=[0.999, 0.001],
     optimizer=optimizer)
 
 def mask_randomly(imgs):
     y1 = np.random.randint(0, img_rows - mask_height, imgs.shape[0])
     y2 = y1 + mask_height
-    x1 = np.random.randint(0, img_cols - mask_width, imgs.shape[0])
+    x1 = np.full([imgs.shape[0]],0)
     x2 = x1 + mask_width
 
     masked_imgs = np.empty_like(imgs)
@@ -162,14 +173,13 @@ def mask_randomly(imgs):
 
 
 X_train = y2_train.copy()
-def train(epochs, batch_size=128, sample_interval=50):
-
+def train(epochs, batch_size=128, sample_interval=50, label_switching=False):
     # Adversarial ground truths
     valid = np.ones((batch_size, 1))
     fake = np.zeros((batch_size, 1))
 
-    for epoch in range(epochs):
-        sys.stdout.flush()
+    for epoch in range(epochs+1):
+
         # ---------------------
         #  Train Discriminator
         # ---------------------
@@ -184,9 +194,16 @@ def train(epochs, batch_size=128, sample_interval=50):
             gen_missing = generator.predict(masked_imgs)
 
             # Train the discriminator
-            d_loss_real = discriminator.train_on_batch(missing_parts, valid)
-            d_loss_fake = discriminator.train_on_batch(gen_missing, fake)
-            d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
+            if (label_switching):
+                valid[np.int16(0.9*valid.shape[0]):] = np.zeros((np.int16(valid.shape[0]-0.9*valid.shape[0])+1, 1))
+                fake[np.int16(0.9*fake.shape[0]):] = np.ones((np.int16(fake.shape[0]-0.9*fake.shape[0])+1, 1))
+                d_loss_real = discriminator.train_on_batch(missing_parts, valid)
+                d_loss_fake = discriminator.train_on_batch(gen_missing, fake)
+                d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
+            else:
+                d_loss_real = discriminator.train_on_batch(missing_parts, valid)
+                d_loss_fake = discriminator.train_on_batch(gen_missing, fake)
+                d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
 
             # ---------------------
             #  Train Generator
@@ -195,14 +212,18 @@ def train(epochs, batch_size=128, sample_interval=50):
             g_loss = combined.train_on_batch(masked_imgs, [missing_parts, valid])
 
             # Plot the progress
+            clear_output(wait=True)
             print ("%d [D loss: %f, acc: %.2f%%] [G loss: %f, mse: %f]" % (epoch, d_loss[0], 100*d_loss[1], g_loss[0], g_loss[1]))
-            print("Epoch {} out of {}".format(epoch, epochs))
             if epoch % sample_interval == 0:
                 idx = np.random.randint(0, X_train.shape[0], 6)
                 imgs = X_train[idx]
                 sample_images(epoch, imgs)
         else:
             print("nan value in training set")
+            if math.isnan(np.sum(X_train[idx])): debugNan = X_train[idx].copy()
+            else: print("masked")
+            sample_images(epoch, imgs)
+
 
 def sample_images(epoch, imgs):
     r, c = 3, 6
@@ -214,12 +235,20 @@ def sample_images(epoch, imgs):
     masked_imgs = 0.5 * masked_imgs + 0.5
     gen_missing = 0.5 * gen_missing + 0.5
 
+    fig, axs = plt.subplots(r, c)
+    fig.subplots_adjust(hspace = .05, wspace=.1)
+    fig.set_size_inches(30,6)
     for i in range(c):
-        np.save("matrices_CEGAN/base_{}_{}".format(epoch, i), imgs[i, :,:].reshape(24,144))
-        np.save("matrices_CEGAN/masked_{}_{}".format(epoch, i), masked_imgs[i, :,:].reshape(24, 144))
+        axs[0,i].imshow(imgs[i, :,:].reshape(24,144),cmap=plt.get_cmap('jet', 20))
+        axs[0,i].set_title("Ground Truth")
+        axs[1,i].imshow(masked_imgs[i, :,:].reshape(24, 144),cmap=plt.get_cmap('jet', 20))
+        axs[1,i].set_title("Masked")
         filled_in = imgs[i].copy()
         filled_in[y1[i]:y2[i], x1[i]:x2[i], :] = gen_missing[i]
-        np.save("matrices_CEGAN/filled_{}_{}".format(epoch, i), filled_in.reshape(24, 144))
+        axs[2,i].imshow(filled_in.reshape(24, 144),cmap=plt.get_cmap('jet', 20))
+        axs[2,i].set_title("Contextual GAN Prediction")
+    fig.savefig("images_CEGAN/%d.png" % epoch)
+    plt.close()
 
 
 def save_model():
@@ -237,5 +266,5 @@ def save_model():
     save(discriminator, "discriminator")
 
 
-train(epochs=5000, batch_size=128, sample_interval=100)
+train(epochs=1000, batch_size=64, sample_interval=100, label_switching=True)
 save_model()
